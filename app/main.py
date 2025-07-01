@@ -1,15 +1,16 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Depends, Path, Body
 from fastapi.middleware.cors import CORSMiddleware
 from app.supabase_client import get_documentos_no_procesados, guardar_procesado, guardar_documento
 from app.processor import procesar_texto
 from app.utils.file_processor import procesar_archivo
 from supabase import create_client, Client
 import os
-from pathlib import Path
 import tempfile
 from app.services.cv_processor import extraer_texto, procesar_cv
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
+from app.integrations.supabase import supabase_client
+from datetime import datetime
 
 app = FastAPI()
 
@@ -149,20 +150,25 @@ async def process_document(request: ProcessDocumentRequest):
             resultado = await procesar_cv(response, request.documento_id)
             print("CV procesado exitosamente")
             
-            # Actualizar estado en la base de datos
-            print("Actualizando estado en la base de datos")
+            # Guardar los resultados en datos_documentos_procesados
             try:
-                # Solo actualizamos el estado por ahora
-                supabase.table('documentos_cargados').update({
-                    'estado': 'procesado'
-                }).eq('documento_id', request.documento_id).execute()
-                print("Estado actualizado exitosamente")
-            except Exception as db_error:
-                print(f"Error al actualizar estado en la base de datos: {str(db_error)}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Error al actualizar estado en la base de datos: {str(db_error)}"
-                )
+                supabase.table('datos_documentos_procesados').insert({
+                    'documento_id': request.documento_id,
+                    'tipo_entidad_procesada': 'cv',
+                    'data_extraida': resultado.get('data_extraida'),
+                    'fecha_procesamiento': resultado.get('fecha_procesamiento'),
+                    'habilidades_indexadas': resultado.get('data_extraida', {}).get('habilidades_indexadas', []),
+                }).execute()
+                print("Resultados guardados en datos_documentos_procesados")
+
+                # Llamar automáticamente a la función de predicción
+                try:
+                    await calculate_prediction(request.documento_id)
+                    print("Predicción generada automáticamente")
+                except Exception as pred_error:
+                    print(f"Error al generar predicción automática: {str(pred_error)}")
+            except Exception as insert_error:
+                print(f"Error al guardar en datos_documentos_procesados: {str(insert_error)}")
 
             return {
                 "status": "success",
@@ -503,4 +509,81 @@ async def calculate_prediction(documento_id: int):
 
 @app.get("/vacantes")
 async def get_vacantes():
-    return [v.dict() for v in vacantes_db if v.activa]
+    response = supabase_client.table('vacantes').select('*').eq('estado', 'activa').execute()
+    return response.data
+
+@app.post("/postulaciones")
+async def postularse(vacante_id: int, request: Request):
+    user = supabase_client.auth.get_user(request)
+    if not user or not user.user:
+        raise HTTPException(status_code=401, detail="No autenticado")
+    usuario_id = user.user.id
+    # Evitar postulaciones duplicadas
+    existing = supabase_client.table('postulaciones').select('postulacion_id').eq('usuario_id', usuario_id).eq('vacante_id', vacante_id).execute()
+    if existing.data and len(existing.data) > 0:
+        raise HTTPException(status_code=400, detail="Ya te has postulado a esta vacante")
+    response = supabase_client.table('postulaciones').insert({
+        "usuario_id": usuario_id,
+        "vacante_id": vacante_id,
+        "fecha_postulacion": datetime.utcnow().isoformat(),
+        "estado": "recibido"
+    }).execute()
+    return {"mensaje": "Postulación registrada", "data": response.data}
+
+@app.get("/mis-postulaciones")
+async def mis_postulaciones(request: Request):
+    user = supabase_client.auth.get_user(request)
+    if not user or not user.user:
+        raise HTTPException(status_code=401, detail="No autenticado")
+    usuario_id = user.user.id
+    response = supabase_client.table('postulaciones').select('*').eq('usuario_id', usuario_id).execute()
+    return response.data
+
+@app.post("/vacantes")
+async def crear_vacante(vacante: dict):
+    try:
+        response = supabase.table('vacantes').insert({
+            "titulo": vacante.get("titulo"),
+            "descripcion": vacante.get("descripcion"),
+            "modalidad": vacante.get("modalidad"),
+            "ubicacion": vacante.get("ubicacion"),
+            "estado": vacante.get("estado"),
+            "requisitos": vacante.get("requisitos")
+        }).execute()
+        return {"mensaje": "Vacante creada", "data": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/vacantes/{vacante_id}")
+async def editar_vacante(
+    vacante_id: int = Path(..., description="ID de la vacante a editar"),
+    vacante: dict = Body(...)
+):
+    try:
+        response = supabase.table('vacantes').update({
+            "titulo": vacante.get("titulo"),
+            "descripcion": vacante.get("descripcion"),
+            "modalidad": vacante.get("modalidad"),
+            "ubicacion": vacante.get("ubicacion"),
+            "estado": vacante.get("estado"),
+            "requisitos": vacante.get("requisitos")
+        }).eq('vacante_id', vacante_id).execute()
+        return {"mensaje": "Vacante actualizada", "data": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/vacantes/{vacante_id}")
+async def eliminar_vacante(vacante_id: int = Path(...)):
+    try:
+        response = supabase.table('vacantes').delete().eq('vacante_id', vacante_id).execute()
+        return {"mensaje": "Vacante eliminada", "data": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/vacantes/{vacante_id}/postulantes")
+async def ver_postulantes_vacante(vacante_id: int = Path(...)):
+    try:
+        response = supabase.table('postulaciones').select('*, usuarios(nombre_usuario, email, rol)').eq('vacante_id', vacante_id).execute()
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
